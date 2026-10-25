@@ -44,7 +44,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     subgraph 獨立群聊架構["Muse Team Chat 架構（全自動交流）"]
-        B["老闆（歪貓）\n專屬金色置中發布"]
+        B["老闆\n專屬金色置中發布"]
         U1["項目主管 supervisor"]
         U2["UIUX設計師 designer"]
         U3["工程師 tin"]

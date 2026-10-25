@@ -20,7 +20,7 @@ from pathlib import Path
 # 基本成員定義
 ROLES_CONFIG = {
     "boss": {
-        "name": "老闆（歪貓）",
+        "name": "老闆",
         "title": "最終拍板、旁觀全程",
         "color": "#D4AF37",
         "align": "center",
