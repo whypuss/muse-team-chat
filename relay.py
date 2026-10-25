@@ -3,12 +3,16 @@
 relay.py - Muse Team Chat 自動中繼與輪詢服務
 - 使用 SQLite 中央訊息庫 (messages 表)
 - 使用 data/watermark.json 防止重複派送
+- 輕量零 Token 輪詢（純 Python 查 SQLite，有新訊息才喚醒 LLM）
+- 訊息前置智能分流 (Pre-routing)，節省大量 Token
+- 突發訊息自動合併 (Burst Merge)
 - 支援 LLM (OpenAI 相容) 或內建角色規則 demo 模式
 - 僅使用 Python 標準庫
 """
 
 import sys
 import os
+import re
 import json
 import sqlite3
 import time
@@ -69,6 +73,57 @@ ROLES_CONFIG = {
     },
 }
 
+# 智能分流關鍵字定義
+SILENCE_KEYWORDS = ["不用回覆", "不用回", "不用回复", "靜默", "静默"]
+BROADCAST_KEYWORDS = ["全體", "全体", "全部", "所有人", "大家"]
+
+ROLE_KEYWORDS = {
+    "tin": {
+        "words": ["tin"],
+        "terms": ["工程", "代碼", "代码", "架構", "架构"],
+    },
+    "cin": {
+        "words": ["cin"],
+        "terms": ["驗收", "验收", "安全", "測試", "测试", "探針", "探针"],
+    },
+    "money": {
+        "words": ["money"],
+        "terms": ["額度", "额度", "費用", "费用", "工具"],
+    },
+    "designer": {
+        "words": ["designer", "ui", "uiux"],
+        "terms": ["設計", "设计", "視覺", "视觉"],
+    },
+    "supervisor": {
+        "words": ["supervisor"],
+        "terms": ["主管", "進度", "进度", "匯報", "汇报", "pj主管"],
+    },
+}
+
+# 內建角色規則 demo 回覆範本
+DEMO_REPLIES = {
+    "supervisor": {
+        "boss": "收到老闆指示！我已記錄並正在統籌全盤排期，將任務梳理後派發給各成員，會定時彙整進度匯報。",
+        "general": "主管收到：已同步各成員反饋，正在整理當前里程碑摘要準備向老闆報告。"
+    },
+    "tin": {
+        "boss": "收到需求。我不會直接硬寫代碼，正將核心流程拆解為獨立模組任務，準備派給免費代碼工具並規劃接口規格。",
+        "general": "tin 收到：模組架構已理清，任務切片已完成，準備透過代碼生成工具產出第一版。"
+    },
+    "cin": {
+        "boss": "收到。針對此需求，我已開始規劃真實任務探針與安全邊界測試案例，絕不以表層 PONG 敷衍，測試通過才驗收。",
+        "general": "cin 收到：正以端到端真任務探針執行掃描，嚴查是否有硬編碼敏感資訊與邏輯漏洞。"
+    },
+    "money": {
+        "boss": "額度監控中：當前各 AI 平臺免費配額充足，已排入最優先隊列，若有卡死將自動降級切換備用模型。",
+        "general": "money 收到：各模型使用量在正常水位內，持續監控並保留足額備用免費額度。"
+    },
+    "designer": {
+        "boss": "視覺與 UIUX 部分已在對齊設計資產與互動風格，保證各裝置無水平溢出且符合品牌色調。",
+        "general": "designer 收到：UIUX 佈局與視覺色標已完成調試，已確認行動端與桌面端排版適配良好。"
+    }
+}
+
 DEFAULT_DB_PATH = os.environ.get("DB_PATH", "data/chat.db")
 DEFAULT_WATERMARK_PATH = os.environ.get("WATERMARK_PATH", "data/watermark.json")
 DEFAULT_POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
@@ -119,16 +174,90 @@ def save_watermark(last_id: int, watermark_path: str = DEFAULT_WATERMARK_PATH) -
     os.replace(temp_path, watermark_path)
 
 
-def load_role_prompt(role: str) -> str:
-    """載入 roles/{role}.md 的說明，若找不到則使用預設說明"""
+def _contains_word(text: str, word: str) -> bool:
+    """檢查英文詞彙或代號是否獨立出現（前後非英數字底線），避免 continue 誤中 tin 或 fruit 誤中 ui"""
+    pattern = rf"(?i)(?<![a-zA-Z0-9_]){re.escape(word)}(?![a-zA-Z0-9_])"
+    return bool(re.search(pattern, text))
+
+
+def match_role_keywords(role: str, body: str) -> bool:
+    """判斷訊息內文是否包含該角色的關鍵字或 @提及"""
+    cfg = ROLE_KEYWORDS.get(role)
+    if not cfg:
+        return False
+    for term in cfg["terms"]:
+        if term in body:
+            return True
+    for word in cfg["words"]:
+        if _contains_word(body, word):
+            return True
+    return False
+
+
+def get_target_roles(incoming_msg: dict) -> list:
+    """
+    分流規則（在調用 LLM 前先做過濾）：
+    - 訊息含「不用回覆／不用回／靜默」→ 全部靜默，零回覆零 LLM 調用。
+    - 訊息含「全體／全部／所有人／大家」→ 全員回覆。
+    - 老闆訊息（非全體）：主管 supervisor 一定回覆統籌，其他角色只在被 @提及、被點名、或命中其職責關鍵字時才回覆。
+    - 成員訊息：只回覆被 @提及／點名／命中關鍵字的角色；若無人命中，主管在含「進度／匯報／主管」時才回覆，否則零回覆。
+    """
+    routing_enabled = os.environ.get("ROUTING_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+    speaker = incoming_msg.get("speaker", "")
+    body = incoming_msg.get("body", "")
+    all_other_roles = [r for r in ROLES_CONFIG.keys() if r != speaker]
+
+    if not routing_enabled:
+        return all_other_roles
+
+    # 1. 訊息含「不用回覆／不用回／靜默」→ 全部靜默，零回覆零 LLM 調用
+    for kw in SILENCE_KEYWORDS:
+        if kw in body:
+            return []
+
+    # 2. 訊息含「全體／全部／所有人／大家」→ 全員回覆
+    for kw in BROADCAST_KEYWORDS:
+        if kw in body:
+            return all_other_roles
+
+    # 3. 老闆訊息（非全體）：主管 supervisor 一定回覆統籌，其他角色命中才回覆
+    if speaker == "boss":
+        targets = []
+        for r in all_other_roles:
+            if r == "supervisor" or match_role_keywords(r, body):
+                targets.append(r)
+        return [r for r in ROLES_CONFIG.keys() if r in targets]
+
+    # 4. 成員訊息：只回覆被 @提及／點名／命中關鍵字的角色；若無人命中，主管在含「進度／匯報／主管」時才回覆，否則零回覆
+    non_sup_matched = [r for r in all_other_roles if r != "supervisor" and match_role_keywords(r, body)]
+    if non_sup_matched:
+        if ("@supervisor" in body.lower() or "主管" in body) and "supervisor" in all_other_roles:
+            targets = non_sup_matched + ["supervisor"]
+        else:
+            targets = non_sup_matched
+        return [r for r in ROLES_CONFIG.keys() if r in targets]
+    else:
+        # 若無其他成員命中，主管在含「進度／匯報／主管」時才回覆，否則零回覆
+        if "supervisor" in all_other_roles and match_role_keywords("supervisor", body):
+            return ["supervisor"]
+        return []
+
+
+def load_role_prompt(role: str, max_chars: int = 600) -> str:
+    """載入 roles/{role}.md 的說明，若找不到則使用預設說明，上限截斷至 max_chars (預設 600 字)"""
     role_file = Path("roles") / f"{role}.md"
+    content = ""
     if role_file.exists():
         try:
-            return role_file.read_text(encoding="utf-8")
+            content = role_file.read_text(encoding="utf-8")
         except Exception:
             pass
-    cfg = ROLES_CONFIG.get(role, {})
-    return f"{cfg.get('name', role)}: {cfg.get('title', '')}"
+    if not content:
+        cfg = ROLES_CONFIG.get(role, {})
+        content = f"{cfg.get('name', role)}: {cfg.get('title', '')}"
+    if len(content) > max_chars:
+        content = content[:max_chars]
+    return content
 
 
 def generate_llm_reply(role: str, message: dict, recent_history: list) -> str:
@@ -140,7 +269,7 @@ def generate_llm_reply(role: str, message: dict, recent_history: list) -> str:
     if not api_key:
         return ""
 
-    role_desc = load_role_prompt(role)
+    role_desc = load_role_prompt(role, max_chars=600)
     system_prompt = (
         f"你是團隊中的成員：{ROLES_CONFIG.get(role, {}).get('name', role)}。\n"
         f"你的職責定義如下：\n{role_desc}\n\n"
@@ -148,7 +277,14 @@ def generate_llm_reply(role: str, message: dict, recent_history: list) -> str:
         "如果你認為此訊息不需要你回覆或與你職責無關，請僅回傳「SILENT」。"
     )
 
-    history_lines = [f"{m['speaker']}: {m['body']}" for m in recent_history[-6:]]
+    # 歷史最多 6 條，每條 body 截斷至 200 字
+    history_lines = []
+    for m in recent_history[-6:]:
+        spk = m.get("speaker", "")
+        b = m.get("body", "")
+        if len(b) > 200:
+            b = b[:200]
+        history_lines.append(f"{spk}: {b}")
     history_text = "\n".join(history_lines)
     user_prompt = f"最新對話記錄：\n{history_text}\n\n請以 {role} 身份回覆："
 
@@ -187,37 +323,21 @@ def generate_demo_reply(role: str, incoming_msg: dict) -> str:
     """當無 LLM 金鑰時，根據角色定義與輸入訊息產生規則性 demo 回覆"""
     speaker = incoming_msg.get("speaker", "")
     body = incoming_msg.get("body", "")
+    role_dict = DEMO_REPLIES.get(role, {})
 
-    # 老闆發指令時，各成員根據職責依序回報
     if speaker == "boss":
-        demo_map = {
-            "supervisor": f"收到老闆指示！我已記錄並正在統籌全盤排期，將任務梳理後派發給各成員，會定時彙整進度匯報。",
-            "tin": f"收到需求。我不會直接硬寫代碼，正將核心流程拆解為獨立模組任務，準備派給免費代碼工具並規劃接口規格。",
-            "cin": f"收到。針對此需求，我已開始規劃真實任務探針與安全邊界測試案例，絕不以表層 PONG 敷衍，測試通過才驗收。",
-            "money": f"額度監控中：當前各 AI 平臺免費配額充足，已排入最優先隊列，若有卡死將自動降級切換備用模型。",
-            "designer": f"視覺與 UIUX 部分已在對齊設計資產與互動風格，保證各裝置無水平溢出且符合品牌色調。",
-        }
-        return demo_map.get(role, "")
+        return role_dict.get("boss", "")
 
-    # 成員互相交流：若特定角色被提到（例如 @tin, @cin, 或提及關鍵字）
-    body_lower = body.lower()
-    if role == "tin" and ("tin" in body_lower or "工程" in body or "代碼" in body or "架構" in body):
-        return "tin 收到：模組架構已理清，任務切片已完成，準備透過代碼生成工具產出第一版。"
-    if role == "cin" and ("cin" in body_lower or "驗收" in body or "安全" in body or "測試" in body or "探針" in body):
-        return "cin 收到：正以端到端真任務探針執行掃描，嚴查是否有硬編碼敏感資訊與邏輯漏洞。"
-    if role == "money" and ("money" in body_lower or "額度" in body or "費用" in body or "工具" in body):
-        return "money 收到：各模型使用量在正常水位內，持續監控並保留足額備用免費額度。"
-    if role == "designer" and ("designer" in body_lower or "設計" in body or "視覺" in body or "ui" in body_lower):
-        return "designer 收到：UIUX 佈局與視覺色標已完成調試，已確認行動端與桌面端排版適配良好。"
-    if role == "supervisor" and ("主管" in body or "進度" in body or "匯報" in body or "supervisor" in body_lower):
-        return "主管收到：已同步各成員反饋，正在整理當前里程碑摘要準備向老闆報告。"
+    # 成員互相交流：若命中職能或提及
+    if match_role_keywords(role, body):
+        return role_dict.get("general", "")
 
     return ""
 
 
 def dispatch_message(incoming_msg: dict, conn: sqlite3.Connection) -> list:
     """
-    將新發生的訊息派送給其他所有成員，收集回覆並寫入資料庫
+    根據分流規則派送新訊息給符合條件的角色，收集回覆並寫入資料庫
     回傳新增的回覆清單
     """
     speaker = incoming_msg["speaker"]
@@ -225,39 +345,41 @@ def dispatch_message(incoming_msg: dict, conn: sqlite3.Connection) -> list:
     body = incoming_msg["body"]
     kind = incoming_msg["kind"]
 
-    # 取得最近對話脈絡（避免傳遞過多無關數據）
+    # 分流決定目標接收角色（在調用 LLM 之前先做）
+    target_roles = get_target_roles(incoming_msg)
+    if not target_roles:
+        return []
+
+    # 取得最近對話脈絡（LLM 歷史上限 6 條，節省 context token）
     cur = conn.cursor()
-    cur.execute("SELECT speaker, body FROM messages WHERE id <= ? ORDER BY id DESC LIMIT 10", (msg_id,))
+    cur.execute("SELECT speaker, body FROM messages WHERE id <= ? ORDER BY id DESC LIMIT 6", (msg_id,))
     recent_history = [dict(r) for r in reversed(cur.fetchall())]
 
     has_llm = bool(os.environ.get("OPENAI_API_KEY", "").strip())
     generated_replies = []
 
-    # 派送給除了發言者之外的所有其他角色
-    target_roles = [r for r in ROLES_CONFIG.keys() if r != speaker]
-
     for role in target_roles:
         reply_text = ""
         if has_llm:
             reply_text = generate_llm_reply(role, incoming_msg, recent_history)
-        
-        # 若無 LLM 或 LLM 無回覆（SILENT / 失敗），退回規則 Demo
-        if not reply_text:
+            # SILENT 即真靜默，絕不退回 demo 回覆
+        else:
+            # Demo 模式（無 key）：僅對分流命中角色產生 demo 回覆
             reply_text = generate_demo_reply(role, incoming_msg)
 
-        if reply_text:
+        if reply_text and reply_text.strip():
             now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             reply_kind = "command_reply" if kind in ("command", "boss") or speaker == "boss" else "chat"
             with conn:
                 cur = conn.execute(
                     "INSERT INTO messages (speaker, body, created_at, kind) VALUES (?, ?, ?, ?)",
-                    (role, reply_text, now_iso, reply_kind)
+                    (role, reply_text.strip(), now_iso, reply_kind)
                 )
                 new_id = cur.lastrowid
                 generated_replies.append({
                     "id": new_id,
                     "speaker": role,
-                    "body": reply_text,
+                    "body": reply_text.strip(),
                     "created_at": now_iso,
                     "kind": reply_kind
                 })
@@ -265,43 +387,78 @@ def dispatch_message(incoming_msg: dict, conn: sqlite3.Connection) -> list:
     return generated_replies
 
 
+def merge_burst_messages(unprocessed: list) -> list:
+    """
+    同批突發合併：同一輪 run_once 入面，若同一發言者連續發多條、其間無其他發言者插隊，
+    只對最後一條做一次分流（body 用換行合併），避免連發刷爆調用次數。
+    單條訊息的舊行為不變。
+    """
+    if not unprocessed:
+        return []
+
+    merged = []
+    current_group = [unprocessed[0]]
+
+    for msg in unprocessed[1:]:
+        if msg["speaker"] == current_group[-1]["speaker"]:
+            current_group.append(msg)
+        else:
+            merged.append(_combine_group(current_group))
+            current_group = [msg]
+
+    if current_group:
+        merged.append(_combine_group(current_group))
+
+    return merged
+
+
+def _combine_group(group: list) -> dict:
+    if len(group) == 1:
+        return group[0]
+    last_msg = group[-1]
+    combined_body = "\n".join(m["body"] for m in group)
+    return {
+        "id": last_msg["id"],
+        "speaker": last_msg["speaker"],
+        "body": combined_body,
+        "created_at": last_msg["created_at"],
+        "kind": last_msg["kind"],
+    }
+
+
 def run_once(db_path: str = DEFAULT_DB_PATH, watermark_path: str = DEFAULT_WATERMARK_PATH) -> list:
     """
     執行單次輪詢檢查：
     1. 讀取 watermark
     2. 查詢未處理訊息 (id > watermark)
-    3. 依序派送處理，更新 watermark
-    4. 回傳所有新產生的回覆訊息
+    3. 合併同發言者連續突發訊息
+    4. 依分流規則派送處理，更新 watermark
+    5. 回傳所有新產生的回覆訊息
     """
     conn = get_db_connection(db_path)
     last_id = load_watermark(watermark_path)
-    
+
     cur = conn.cursor()
     cur.execute(
         "SELECT id, speaker, body, created_at, kind FROM messages WHERE id > ? ORDER BY id ASC",
         (last_id,)
     )
     unprocessed = [dict(r) for r in cur.fetchall()]
-    
+
     if not unprocessed:
         conn.close()
         return []
 
-    all_new_replies = []
-    highest_processed_id = last_id
+    highest_processed_id = max(last_id, max(m["id"] for m in unprocessed))
 
-    for msg in unprocessed:
-        # 如果這條訊息是其他成員自動產生的回覆且當前無特定艾特，我們記錄 watermark，但避免無限遞歸連鎖
+    # 同批突發合併
+    dispatch_queue = merge_burst_messages(unprocessed)
+
+    all_new_replies = []
+    for msg in dispatch_queue:
         replies = dispatch_message(msg, conn)
         all_new_replies.extend(replies)
-        if msg["id"] > highest_processed_id:
-            highest_processed_id = msg["id"]
 
-    # 注意：成員回覆產生了新的訊息 id，若將 watermark 移至 highest_processed_id，
-    # 剛產生的回覆將會在下一輪作為 candidate；如果回覆本身沒有觸發任何其他角色，
-    # 就不會產生新訊息。為了更乾淨地終結本輪事件，如果本輪由 boss 或用戶觸發，
-    # 我們將 watermark 更新為所有已派送訊息的最大 id（包含剛產生的 replies），
-    # 避免成員對成員的回覆產生無限反覆確認。
     if all_new_replies:
         max_reply_id = max(r["id"] for r in all_new_replies)
         highest_processed_id = max(highest_processed_id, max_reply_id)
@@ -313,9 +470,11 @@ def run_once(db_path: str = DEFAULT_DB_PATH, watermark_path: str = DEFAULT_WATER
 
 def poll_loop(db_path: str = DEFAULT_DB_PATH, watermark_path: str = DEFAULT_WATERMARK_PATH, interval: float = DEFAULT_POLL_INTERVAL):
     """常駐輪詢主迴圈"""
+    routing_mode = "啟用 (ROUTING_ENABLED=1)" if os.environ.get("ROUTING_ENABLED", "1").strip().lower() not in ("0", "false", "no") else "停用 (全員回覆)"
     print(f"[RELAY] 啟動自動中繼輪詢服務 (間隔: {interval}s)")
     print(f"[RELAY] 資料庫路徑: {db_path}")
     print(f"[RELAY] 浮水印檔案: {watermark_path}")
+    print(f"[RELAY] 智能分流: {routing_mode}")
     print(f"[RELAY] 模式: {'LLM 連接 (' + os.environ.get('MODEL', '') + ')' if os.environ.get('OPENAI_API_KEY') else '角色規則 Demo 模式'}")
 
     try:

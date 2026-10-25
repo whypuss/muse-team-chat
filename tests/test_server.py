@@ -94,7 +94,7 @@ class TestServerAPI(unittest.TestCase):
         url = f"http://127.0.0.1:{self.port}/api/messages"
         payload = {
             "speaker": "boss",
-            "body": "測試命令：全面啟動端對端流程驗收。",
+            "body": "全體測試命令：全面啟動端對端流程驗收。",
             "kind": "command"
         }
         req = urllib.request.Request(
