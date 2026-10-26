@@ -119,7 +119,8 @@ muse-team-chat/
 ├── data/
 │   └── .gitkeep             # 執行期存放 chat.db 與 watermark.json
 ├── docs/
-│   └── muse-adaptation.md   # Muse 原生架構限制與獨立版適配說明
+│   ├── muse-adaptation.md   # Muse 原生架構限制與獨立版適配說明
+│   └── SOP.md               # 項目主管管理員工標準作業程序（新員工入職直接交本文件）
 ├── roles/                   # 各成員職責定義 Markdown
 │   ├── boss.md              # 老闆
 │   ├── supervisor.md        # 項目主管
